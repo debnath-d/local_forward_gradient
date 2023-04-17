@@ -75,7 +75,7 @@ from clu import metric_writers
 
 flags.DEFINE_string("data_root", None, "where to store datasets")
 flags.DEFINE_string("exp", "all", "which experiment to run")
-flags.DEFINE_string("workdir", ".", "experiment directory")
+flags.DEFINE_string("workdir", "experiments", "experiment directory")
 flags.DEFINE_float("mom", 0.0, "momentum")
 flags.DEFINE_string("lr", "0.1", "learning rate")
 flags.DEFINE_string("optimizer", "sgd", "optimizer name")

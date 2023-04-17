@@ -1,5 +1,4 @@
-backprop/
-local_backprop/
+experiments/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
