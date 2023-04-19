@@ -2525,7 +2525,7 @@ def run_exp(
             key = jax.random.PRNGKey(0)
 
     step = epoch_start * num_batches
-    lr_ = scheduler(epoch_start * num_batches)
+    lr_ = scheduler(step)
     for epoch in range(epoch_start, num_epochs):
         total_loss = 0.0
         train_acc = 0.0
@@ -2645,8 +2645,7 @@ def main(_):
     if experiment == "all":
         keys = [
             "backprop",
-            "local_backprop",
-            "local_stopgrad_backprop",
+            "forward_grad_weights",
             "forward_grad_activations",
         ]
         lr_list = [float(s) for s in FLAGS.lr.split(",")]
