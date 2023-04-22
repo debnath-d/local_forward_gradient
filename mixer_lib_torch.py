@@ -272,8 +272,12 @@ def linear(inputs, weight, bias=None):
 
 
 def fa_group_linear(inputs, fw_weight, fw_bias, bw_weight):
-    outputs = torch.einsum("npgc,pgcd->npgd", inputs, fw_weight)
-    bw_outputs = torch.einsum("npgc,pgcd->npgd", inputs, bw_weight)
+    if len(inputs.shape) == 4:
+        outputs = torch.einsum("npgc,pgcd->npgd", inputs, fw_weight)
+        bw_outputs = torch.einsum("npgc,pgcd->npgd", inputs, bw_weight)
+    elif len(inputs.shape) == 3:
+        outputs = torch.einsum("npgc,gcd->npgd", inputs, fw_weight)
+        bw_outputs = torch.einsum("npgc,gcd->npgd", inputs, bw_weight)
     return torch.add(outputs, bw_outputs, alpha=-1.0).detach() + bw_outputs + fw_bias
 
 
