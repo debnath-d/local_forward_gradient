@@ -75,7 +75,7 @@ from clu import metric_writers
 
 # jax.config.update("jax_array", True)
 
-flags.DEFINE_string("data_root", None, "where to store datasets")
+flags.DEFINE_string("data_root", "datasets", "where to store datasets")
 flags.DEFINE_string("exp", "all", "which experiment to run")
 flags.DEFINE_string("workdir", "experiments", "experiment directory")
 flags.DEFINE_float("mom", 0.0, "momentum")
