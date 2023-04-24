@@ -73,6 +73,8 @@ from absl import flags
 from jax import grad
 from clu import metric_writers
 
+# jax.config.update("jax_array", True)
+
 flags.DEFINE_string("data_root", None, "where to store datasets")
 flags.DEFINE_string("exp", "all", "which experiment to run")
 flags.DEFINE_string("workdir", "experiments", "experiment directory")
@@ -146,9 +148,10 @@ def mlp_block(
     print("inputs", inputs.shape)
     conv = FLAGS.conv_mixer
     states = {}
+    # B = batch_size, P = num_patches * num_patches
     B, P = inputs.shape[0], inputs.shape[1]
     G = num_groups
-    H = int(math.sqrt(P))
+    H = int(math.sqrt(P))  # num_patches
     if FLAGS.stopgrad_input:
         inputs_ = jax.lax.stop_gradient(inputs)
     else:
@@ -199,7 +202,7 @@ def mlp_block(
     if len(params[1]) == 3:  # Feedback alignment
         outputs = fa_linear(outputs, params[1][0], params[1][1], params[1][2])
     else:
-        outputs = linear(outputs, params[1][0], params[1][1])
+        outputs = linear(outputs, params[1][0], params[1][1])  # wx + b
     states[f"{name}/prenorm_1"] = outputs
     if FLAGS.post_linear_ln:
         outputs = normalize_layer(outputs)
@@ -229,7 +232,7 @@ def mlp_block(
     if params[1][0].shape[0] != params[1][0].shape[1]:
         # Double the channels.
         inputs = jnp.concatenate([inputs, inputs], axis=2)
-    outputs = outputs + inputs
+    outputs = outputs + inputs  # Residual connection
     outputs = jax.nn.relu(outputs)
     if mask is not None:
         outputs = outputs * mask
@@ -250,7 +253,9 @@ def block0(
     if len(params[0]) == 3:  # Feedback alignment
         outputs = fa_linear(outputs, params[0][0], params[0][1], params[0][2])
     else:
-        outputs = linear(outputs, params[0][0], params[0][1])
+        outputs = linear(
+            outputs, params[0][0], params[0][1]
+        )  # param[0][0] = W, param[0][1] = b
     states[f"{name}/prenorm_0"] = outputs
     if FLAGS.post_linear_ln:
         outputs = normalize_layer(outputs)
@@ -263,7 +268,7 @@ def block0(
     if stop_every_layer:
         outputs = jax.lax.stop_gradient(outputs)
 
-    B, P, D = outputs.shape
+    B, P, D = outputs.shape  # B = batch size, P = patch size, D = embedding dimension
     G = num_groups
     outputs = jnp.reshape(outputs, [B, P, G, -1])
     if FLAGS.middle_ln:
@@ -363,15 +368,18 @@ def predict(
             stop_every_layer=stop_every_layer,
         )
         x_proj = x
-        if FLAGS.inter_ln:
+        if FLAGS.inter_ln:  # layer norm before intermedite read out
             x_proj = normalize(x_proj)
         states[f"block_{blk}/pre_pred"] = x_proj
 
+        # all_states = all_states | states
         for k in states:
             all_states[k] = states[k]
+        # all_logs = all_logs | logs
         for k in logs:
             all_logs[k] = logs[k]
 
+        # FLAGS.stopgrad_input: whether to stopgrad on the input
         if stop_gradient and not FLAGS.stopgrad_input:
             if blk % stop_every == stop_remainder:
                 x = jax.lax.stop_gradient(x)
@@ -466,7 +474,7 @@ def loss(
         stop_remainder=stop_remainder,
         is_training=True,
     )
-    loss = classif_loss(logits, targets_onehot)
+    loss = classif_loss(logits, targets_onehot)  # cross entropy loss
     if avg_batch:
         loss = jnp.mean(loss)
     predicted_class = jnp.argmax(logits, axis=-1)
@@ -481,7 +489,7 @@ def loss(
     avgpool_token = FLAGS.avgpool_token
     for blk in range(NBLK):
         x_proj = states[f"block_{blk}/pre_pred"]
-        B, P = x_proj.shape[0], x_proj.shape[1]
+        B, P = x_proj.shape[0], x_proj.shape[1]  # B: batch size, P: number of patches
         param_ = params[NL + blk]
         if FLAGS.fuse_cross_entropy:
             if custom_forward:
@@ -514,6 +522,9 @@ def loss(
 
 
 def classif_loss(logits, targets):
+    """
+    Calculate the cross-entropy loss between the logits and the labels.
+    """
     logits = logits - logsumexp(logits, axis=-1, keepdims=True)
     if len(logits.shape) == 3:
         targets = targets[:, None, :]
@@ -600,19 +611,19 @@ def update_forward_grad_weights(params, batch, key):
         label = jax.nn.one_hot(batch["label"], md["num_classes"])
         G = num_groups
         M = num_passes
-        NL = get_num_layers(NBLK)
-        main_params = params[:NL]
-        loss_params = params[NL:]
+        NL = get_num_layers(NBLK)  # number of layers in the main network
+        main_params = params[:NL]  # 11 of the 16 layers (main network layers)
+        loss_params = params[NL:]  # 5 of the 16 layers (classification layers)
 
-        for i, (weight, bias) in enumerate(main_params):
-            blk, layer = get_blk(i)
+        for i, (weight, bias) in enumerate(main_params):  # add noise to main_params
+            # blk, layer = get_blk(i)  # useless code
             key, subkey = jax.random.split(key)
             dw = jax.random.normal(subkey, weight.shape)
             key, subkey = jax.random.split(key)
             db = jax.random.normal(subkey, bias.shape)
             noise.append((dw, db))
 
-        for i, (weight, bias) in enumerate(loss_params):
+        for i, (weight, bias) in enumerate(loss_params):  # add noise to loss_params
             noise.append((jnp.zeros_like(weight), jnp.zeros_like(bias)))
 
         # [L,B,P]
@@ -630,15 +641,18 @@ def update_forward_grad_weights(params, batch, key):
             # [B, P, G] -> [G]
             g_ = jnp.sum(g_, axis=[0, 1])
 
+            # 1st layer of blocks following the first block
             if blk > 0 and layer == 0:
                 g_ = jnp.sum(g_)  # []
                 grad_w = g_ * dw
                 grad_b = g_ * db
+            # 1st layer of first block or 2nd layer of following blocks
             elif (blk == 0 and layer == 0) or (blk > 0 and layer == 1):
                 dw = jnp.reshape(dw, [weight.shape[0], G, weight.shape[1] // G])
                 db = jnp.reshape(db, [G, -1])
                 grad_w = g_[None, :, None] * dw
                 grad_b = g_[:, None] * db
+            # 2nd layer of first block or 3rd layer of following blocks
             elif (blk == 0 and layer == 1) or layer == 2:
                 dw = jnp.reshape(dw, [G, weight.shape[0], -1])
                 db = jnp.reshape(db, [G, -1])
@@ -1240,8 +1254,11 @@ def run_exp(
             )
             key = jax.pmap(lambda i: i, axis_name="i")(key)
     else:
-        step_fn = jax.jit(step_fn)
-        accuracy_fn = jax.jit(accuracy)
+        accuracy_fn = accuracy
+        debug = True
+        if not debug:
+            step_fn = jax.jit(step_fn)
+            accuracy_fn = jax.jit(accuracy)
         if epoch_start == 0:
             opt_state = optimizer.init(params)
             key = jax.random.PRNGKey(0)

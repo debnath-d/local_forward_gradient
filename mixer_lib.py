@@ -201,17 +201,20 @@ def linear(inputs, weight, bias=None):
     if len(inputs.shape) == 3:
         if len(weight.shape) == 3:
             # No share weights.
-            output = jnp.einsum("npc,pcd->npd", inputs, weight) + bias
+            output = jnp.einsum("npc,pcd->npd", inputs, weight)
         else:
-            output = jnp.einsum("npc,cd->npd", inputs, weight) + bias
+            output = jnp.einsum("npc,cd->npd", inputs, weight)  # out = xw
     else:
         output = jnp.dot(inputs, weight)
     if bias is not None:
-        output = output + bias
+        output = output + bias  # out = xw + b
     return output
 
 
 def fa_group_linear(inputs, fw_weight, fw_bias, bw_weight):
+    """
+    Linear layer for feedback alignment.
+    """
     B, P, G, D = inputs.shape
     if len(fw_weight.shape) == 4:
         outputs = jnp.einsum("npgc,pgcd->npgd", inputs, fw_weight)
@@ -224,13 +227,14 @@ def fa_group_linear(inputs, fw_weight, fw_bias, bw_weight):
 
 def group_linear(inputs, weight, bias=None):
     B, P, G, D = inputs.shape
+    # B: batch size, P: number of patches, G: number of groups, D: number of features
     if len(weight.shape) == 4:
         outputs = jnp.einsum("npgc,pgcd->npgd", inputs, weight)
     elif len(weight.shape) == 3:
         # weight = jnp.reshape(weight, [G, weight.shape[0], -1])
-        outputs = jnp.einsum("npgc,gcd->npgd", inputs, weight)
+        outputs = jnp.einsum("npgc,gcd->npgd", inputs, weight)  # out = xw
     if bias is not None:
-        outputs = outputs + bias
+        outputs = outputs + bias  # out = xw + b
     return outputs
 
 
@@ -314,6 +318,24 @@ def get_blk(i):
 
 
 def get_blk_idx(idx):
+    """
+    get_blk_idx(0)
+
+    (0, 2)
+
+    get_blk_idx(1)
+
+    (2, 5)
+
+    get_blk_idx(2)
+
+    (5, 8)
+
+    get_blk_idx(3)
+
+    (8, 11)
+
+    """
     if idx == 0:
         return 0, NFIRST
     else:
