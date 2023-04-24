@@ -1,20 +1,7 @@
 # coding=utf-8
-# Copyright 2022 The Google Research Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 # pylint: skip-file
-"""A basic CIFAR example using Numpy and JAX.
+"""A basic CIFAR example using Numpy and PyTorch.
 
 The primary aim here is simplicity and minimal dependencies.
 """
@@ -72,6 +59,10 @@ from absl import app
 from absl import flags
 from jax import grad
 from clu import metric_writers
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 # jax.config.update("jax_array", True)
 
@@ -997,120 +988,9 @@ def get_dataset_cifar10(split, seed=0):
     yield from tfds.as_numpy(ds)
 
 
-def _to_imagenet100_split(split):
-    """Returns the TFDS split appropriately sharded."""
-    if split in ["train", "train_eval"]:
-        return "train"
-    elif split == "test":
-        return "validation"
-
-
-def _to_imagenet2012_split(split):
-    """Returns the TFDS split appropriately sharded."""
-    if split in ["train", "train_eval"]:
-        return "train"
-    elif split == "test":
-        return "validation"
-
-
-def get_dataset_imagenet100(split, imagenet2012=False, seed=0):
-    batch_size = FLAGS.batch_size
-    data_dir = FLAGS.data_root
-    if imagenet2012:
-        splits = tfds.even_splits(
-            _to_imagenet2012_split(split), n=jax.process_count(), drop_remainder=True
-        )
-        process_split = splits[jax.process_index()]
-        ds = tfds.load(
-            "imagenet2012",
-            split=process_split,
-            data_dir=FLAGS.gcs_path if FLAGS.use_gcs else data_dir,
-            shuffle_files=True,
-            decoders={"image": tfds.decode.SkipDecoding()},
-            try_gcs=FLAGS.use_gcs,
-        )
-    else:
-        if FLAGS.use_gcs:
-            ds = tfds.load(
-                "imagenet100",
-                split=_to_imagenet100_split(split),
-                data_dir=FLAGS.gcs_path,
-                shuffle_files=True,
-                decoders={"image": {"encoded": tfds.decode.SkipDecoding()}},
-                try_gcs=FLAGS.use_gcs,
-            )
-        else:
-            ds = tfds.load(
-                "imagenet100",
-                split=_to_imagenet100_split(split),
-                data_dir=data_dir,
-                shuffle_files=True,
-                decoders={"image": {"encoded": tfds.decode.SkipDecoding()}},
-            )
-            # builder = tfds.ImageFolder(
-            #     os.path.join(data_dir, 'downloads', 'imagenet-100'))
-            # ds = builder.as_dataset(split=_to_imagenet100_split(split),
-            #                         shuffle_files=True,
-            #                         decoders={'image': tfds.decode.SkipDecoding()})
-    ds = ds.repeat()
-    ds = ds.shuffle(buffer_size=10 * batch_size, seed=jax.process_index() * 1234 + seed)
-    is_parallel = jax.device_count() > 1
-    num_parallel = jax.local_device_count()
-    if imagenet2012:
-        md = get_dataset_metadata("imagenet2012")
-    else:
-        md = get_dataset_metadata("imagenet-100")
-
-    def preprocess(example):
-        image = example["image"]
-        if type(image) is dict:
-            image = image["encoded"]
-        if split == "train":
-            if FLAGS.aug:
-                image = _decode_and_random_crop(image, area_lb=FLAGS.area_lb)
-            else:
-                image = _decode_and_center_crop(image, md["input_height"])
-            image = tf.image.random_flip_left_right(image)
-            assert image.dtype == tf.uint8
-        else:
-            image = _decode_and_center_crop(image, md["input_height"])
-        image = tf.image.resize(
-            image,
-            [md["input_height"], md["input_width"]],
-            tf.image.ResizeMethod.BICUBIC,
-        )
-        image = tf.clip_by_value(image / 255.0, 0.0, 1.0)
-        if "label" in example:
-            label = tf.cast(example["label"], tf.int32)
-        else:
-            label = tf.cast(example["image"]["class"]["label"], tf.int32)
-        return {"image": image, "label": label}
-
-    ds = ds.map(preprocess, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-    ds = ds.batch(batch_size)
-
-    def rebatch(batch):
-        if is_parallel:
-            for k in batch:
-                batch[k] = tf.reshape(
-                    batch[k],
-                    [num_parallel, batch_size // num_parallel]
-                    + list(batch[k].shape[1:]),
-                )
-        return batch
-
-    ds = ds.map(rebatch, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-    ds = ds.prefetch(tf.data.experimental.AUTOTUNE)
-    yield from tfds.as_numpy(ds)
-
-
 def get_dataset(split, seed=0):
     if FLAGS.dataset in ["cifar-10"]:
         return get_dataset_cifar10(split, seed=seed)
-    elif FLAGS.dataset in ["imagenet-100"]:
-        return get_dataset_imagenet100(split, seed=seed)
-    elif FLAGS.dataset in ["imagenet2012"]:
-        return get_dataset_imagenet100(split, imagenet2012=True, seed=seed)
     else:
         raise ValueError("Dataset not found {}".format(FLAGS.dataset))
 
