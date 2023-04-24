@@ -564,7 +564,6 @@ def update_backprop(params, batch, key):
 def update_forward_grad_weights(params, batch, key):
     num_patches = FLAGS.num_patches
     num_groups = FLAGS.num_groups
-    num_passes = FLAGS.num_passes
     md = get_dataset_metadata(FLAGS.dataset)
     grads_now = [
         (jnp.zeros_like(weight), jnp.zeros_like(bias)) for (weight, bias) in params
@@ -595,90 +594,88 @@ def update_forward_grad_weights(params, batch, key):
         )
         return local_loss_, (states, logs)
 
-    for npass in range(num_passes):
-        noise = []
-        num_items = num_patches**2
-        NBLK = FLAGS.num_blocks
-        label = jax.nn.one_hot(batch["label"], md["num_classes"])
-        G = num_groups
-        M = num_passes
-        NL = get_num_layers(NBLK)  # number of layers in the main network
-        main_params = params[:NL]  # 11 of the 16 layers (main network layers)
-        loss_params = params[NL:]  # 5 of the 16 layers (classification layers)
+    noise = []
+    num_items = num_patches**2
+    NBLK = FLAGS.num_blocks
+    label = jax.nn.one_hot(batch["label"], md["num_classes"])
+    G = num_groups
+    NL = get_num_layers(NBLK)  # number of layers in the main network
+    main_params = params[:NL]  # 11 of the 16 layers (main network layers)
+    loss_params = params[NL:]  # 5 of the 16 layers (classification layers)
 
-        for i, (weight, bias) in enumerate(main_params):  # add noise to main_params
-            # blk, layer = get_blk(i)  # useless code
-            key, subkey = jax.random.split(key)
-            dw = jax.random.normal(subkey, weight.shape)
-            key, subkey = jax.random.split(key)
-            db = jax.random.normal(subkey, bias.shape)
-            noise.append((dw, db))
+    for i, (weight, bias) in enumerate(main_params):  # add noise to main_params
+        # blk, layer = get_blk(i)  # useless code
+        key, subkey = jax.random.split(key)
+        dw = jax.random.normal(subkey, weight.shape)
+        key, subkey = jax.random.split(key)
+        db = jax.random.normal(subkey, bias.shape)
+        noise.append((dw, db))
 
-        for i, (weight, bias) in enumerate(loss_params):  # add noise to loss_params
-            noise.append((jnp.zeros_like(weight), jnp.zeros_like(bias)))
+    for i, (weight, bias) in enumerate(loss_params):  # add noise to loss_params
+        noise.append((jnp.zeros_like(weight), jnp.zeros_like(bias)))
 
-        # [L,B,P]
-        _, g, (states, logs) = jax.jvp(local_loss, [params], [noise], has_aux=True)
+    # [L,B,P]
+    _, g, (states, logs) = jax.jvp(local_loss, [params], [noise], has_aux=True)
 
-        # Main network layers.
-        for i, ((weight, bias), (dw, db)) in enumerate(zip(main_params, noise)):
-            blk, layer = get_blk(i)
-            # Forward gradient.
-            if FLAGS.modular_loss:
-                g_ = g[blk]
-            else:
-                g_ = g
+    # Main network layers.
+    for i, ((weight, bias), (dw, db)) in enumerate(zip(main_params, noise)):
+        blk, layer = get_blk(i)
+        # Forward gradient.
+        if FLAGS.modular_loss:
+            g_ = g[blk]
+        else:
+            g_ = g
 
-            # [B, P, G] -> [G]
-            g_ = jnp.sum(g_, axis=[0, 1])
+        # [B, P, G] -> [G]
+        g_ = jnp.sum(g_, axis=[0, 1])
 
-            # 1st layer of blocks following the first block
-            if blk > 0 and layer == 0:
-                g_ = jnp.sum(g_)  # []
-                grad_w = g_ * dw
-                grad_b = g_ * db
-            # 1st layer of first block or 2nd layer of following blocks
-            elif (blk == 0 and layer == 0) or (blk > 0 and layer == 1):
-                dw = jnp.reshape(dw, [weight.shape[0], G, weight.shape[1] // G])
-                db = jnp.reshape(db, [G, -1])
-                grad_w = g_[None, :, None] * dw
-                grad_b = g_[:, None] * db
-            # 2nd layer of first block or 3rd layer of following blocks
-            elif (blk == 0 and layer == 1) or layer == 2:
-                dw = jnp.reshape(dw, [G, weight.shape[0], -1])
-                db = jnp.reshape(db, [G, -1])
-                grad_w = g_[:, None, None] * dw
-                grad_b = g_[:, None] * db
-            print(blk, layer, weight.shape, grad_w.shape)
-            # assert False
-            grad_w = jnp.reshape(grad_w, weight.shape)
-            grad_b = jnp.reshape(grad_b, bias.shape)
-            idx = i
-            grads_now[idx] = (
-                grads_now[idx][0] + grad_w / float(M),
-                grads_now[idx][1] + grad_b / float(M),
-            )
+        # 1st layer of blocks following the first block
+        if blk > 0 and layer == 0:
+            g_ = jnp.sum(g_)  # []
+            grad_w = g_ * dw
+            grad_b = g_ * db
+        # 1st layer of first block or 2nd layer of following blocks
+        elif (blk == 0 and layer == 0) or (blk > 0 and layer == 1):
+            dw = jnp.reshape(dw, [weight.shape[0], G, weight.shape[1] // G])
+            db = jnp.reshape(db, [G, -1])
+            grad_w = g_[None, :, None] * dw
+            grad_b = g_[:, None] * db
+        # 2nd layer of first block or 3rd layer of following blocks
+        elif (blk == 0 and layer == 1) or layer == 2:
+            dw = jnp.reshape(dw, [G, weight.shape[0], -1])
+            db = jnp.reshape(db, [G, -1])
+            grad_w = g_[:, None, None] * dw
+            grad_b = g_[:, None] * db
+        print(blk, layer, weight.shape, grad_w.shape)
+        # assert False
+        grad_w = jnp.reshape(grad_w, weight.shape)
+        grad_b = jnp.reshape(grad_b, bias.shape)
+        idx = i
+        grads_now[idx] = (
+            grads_now[idx][0] + grad_w,
+            grads_now[idx][1] + grad_b,
+        )
 
-        # Classification layers.
-        for i, (weight, bias) in enumerate(loss_params):
-            blk = i  # Every block has a loss.
-            if i == len(loss_params) - 1:
-                # Last classification layer.
-                pre_act = states[f"pre_final"]
-                grad_w, grad_b = global_classif_grad(pre_act, weight, bias, label)
-                grad_w = grad_w * FLAGS.last_layer_lr
-                grad_b = grad_b * FLAGS.last_layer_lr
-            else:
-                # Intermediate classification layer.
-                pre_act = states[f"block_{blk}/pre_pred"]
-                grad_w, grad_b = local_classif_grad(pre_act, weight, bias, label)
-                grad_w = grad_w * FLAGS.head_lr
-                grad_b = grad_b * FLAGS.head_lr
-            idx = i + NL
-            grads_now[idx] = (
-                grads_now[idx][0] + grad_w / float(M),
-                grads_now[idx][1] + grad_b / float(M),
-            )
+    # Classification layers.
+    for i, (weight, bias) in enumerate(loss_params):
+        blk = i  # Every block has a loss.
+        if i == len(loss_params) - 1:
+            # Last classification layer.
+            pre_act = states[f"pre_final"]
+            grad_w, grad_b = global_classif_grad(pre_act, weight, bias, label)
+            grad_w = grad_w * FLAGS.last_layer_lr
+            grad_b = grad_b * FLAGS.last_layer_lr
+        else:
+            # Intermediate classification layer.
+            pre_act = states[f"block_{blk}/pre_pred"]
+            grad_w, grad_b = local_classif_grad(pre_act, weight, bias, label)
+            grad_w = grad_w * FLAGS.head_lr
+            grad_b = grad_b * FLAGS.head_lr
+        idx = i + NL
+        grads_now[idx] = (
+            grads_now[idx][0] + grad_w,
+            grads_now[idx][1] + grad_b,
+        )
 
     if FLAGS.optimizer == "sgd" and wd > 0.0:
         grads_now = [(gw + wd * w, gb) for (gw, gb), (w, b) in zip(grads_now, params)]
@@ -695,7 +692,6 @@ def sample_activation_noise(
     num_groups,
     num_blocks,
     conv=False,
-    num_passes=1,
 ):
     noise = []
     H = num_hid_units
@@ -742,8 +738,6 @@ def sample_activation_noise(
                 out_shape = [B, P_, H_]
             else:
                 out_shape = [B, P_, G_, D_ // G_]
-        if num_passes > 1:
-            out_shape = [num_passes] + out_shape
         key, subkey = jax.random.split(key)
         dz = jax.random.normal(subkey, out_shape)
         noise.append(dz)
@@ -773,7 +767,6 @@ def update_forward_grad_activations(params, batch, key):
         hid_unit_list.append(hid_unit_list[-1] * channel_ratio[blk])
         unit_list.append(unit_list[-1] * channel_ratio[blk])
 
-    num_passes = FLAGS.num_passes
     conv = FLAGS.conv_mixer
     md = get_dataset_metadata(FLAGS.dataset)
     grads_now = [
@@ -813,121 +806,118 @@ def update_forward_grad_activations(params, batch, key):
         )
         return local_loss_, (states, logs)
 
-    for npass in range(num_passes):
-        zeros = []
-        noise = []
-        B = batch["image"].shape[0]
-        label = jax.nn.one_hot(batch["label"], md["num_classes"])
-        M = num_passes
-        NL = get_num_layers(NBLK)
-        main_params = params[:NL]
-        loss_params = params[NL:]
-        noise, key = sample_activation_noise(
-            params,
-            key,
-            B,
-            num_items,
-            num_hid_units,
-            num_units,
-            num_groups,
-            NBLK,
-            conv=conv,
-            num_passes=1,
-        )
-        zeros = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), noise)
+    zeros = []
+    noise = []
+    B = batch["image"].shape[0]
+    label = jax.nn.one_hot(batch["label"], md["num_classes"])
+    NL = get_num_layers(NBLK)
+    main_params = params[:NL]
+    loss_params = params[NL:]
+    noise, key = sample_activation_noise(
+        params,
+        key,
+        B,
+        num_items,
+        num_hid_units,
+        num_units,
+        num_groups,
+        NBLK,
+        conv=conv,
+    )
+    zeros = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), noise)
 
-        # [L,B,P]
-        _, g, (states, logs) = jax.jvp(local_loss, [zeros], [noise], has_aux=True)
+    # [L,B,P]
+    _, g, (states, logs) = jax.jvp(local_loss, [zeros], [noise], has_aux=True)
 
-        # Main network layers.
-        for i, ((weight, bias), dz) in enumerate(zip(main_params, noise)):
-            blk, layer = get_blk(i)
-            # Forward gradient.
-            pre_act = states[f"block_{blk}/pre_{layer}"]
-            prenorm_act = states[f"block_{blk}/prenorm_{layer}"]
-            post_act = states[f"block_{blk}/post_{layer}"]
-            mask = (post_act > 0.0).astype(jnp.float32)
-            G_ = group_list[blk]
-            P_ = token_list[blk]
+    # Main network layers.
+    for i, ((weight, bias), dz) in enumerate(zip(main_params, noise)):
+        blk, layer = get_blk(i)
+        # Forward gradient.
+        pre_act = states[f"block_{blk}/pre_{layer}"]
+        prenorm_act = states[f"block_{blk}/prenorm_{layer}"]
+        post_act = states[f"block_{blk}/post_{layer}"]
+        mask = (post_act > 0.0).astype(jnp.float32)
+        G_ = group_list[blk]
+        P_ = token_list[blk]
 
-            if FLAGS.modular_loss:
-                g_ = g[blk]
+        if FLAGS.modular_loss:
+            g_ = g[blk]
+        else:
+            g_ = g
+
+        # [B, D] -> [B, D, P] or [B, P] -> [B, P, D]
+        if blk > 0 and layer == 0:
+            # Token mixing layer
+            if conv:
+                g_ = jnp.sum(g_, axis=-1, keepdims=True)  # [2B, P, 1]
             else:
-                g_ = g
+                g_ = jnp.sum(g_, axis=-1)[:, None, :]  # [2B, 1, P]
+        else:
+            # Channel mixing layer
+            dz = jnp.reshape(dz, [B, P_, G_, -1])
+            mask = jnp.reshape(mask, [B, P_, G_, -1])
+            g_ = g_[:, :, :, None]
 
-            # [B, D] -> [B, D, P] or [B, P] -> [B, P, D]
+        grad_z = g_ * dz * mask
+
+        # Backprop through normalization.
+        if FLAGS.norm_grad and FLAGS.post_linear_ln:
             if blk > 0 and layer == 0:
-                # Token mixing layer
-                if conv:
-                    g_ = jnp.sum(g_, axis=-1, keepdims=True)  # [2B, P, 1]
-                else:
-                    g_ = jnp.sum(g_, axis=-1)[:, None, :]  # [2B, 1, P]
+                grad_z = jnp.reshape(
+                    ln_grad1(prenorm_act, jnp.reshape(grad_z, prenorm_act.shape)),
+                    dz.shape,
+                )
             else:
-                # Channel mixing layer
-                dz = jnp.reshape(dz, [B, P_, G_, -1])
-                mask = jnp.reshape(mask, [B, P_, G_, -1])
-                g_ = g_[:, :, :, None]
+                grad_z = jnp.reshape(
+                    ln_grad(prenorm_act, jnp.reshape(grad_z, prenorm_act.shape)),
+                    dz.shape,
+                )
 
-            grad_z = g_ * dz * mask
+        if blk > 0 and layer == 0 and conv:
+            # Token mixing conv
+            H_ = int(math.sqrt(P_))
+            grad_z = jnp.reshape(grad_z, [B, H_, H_, -1])
+            grad_w = conv_grad(weight, pre_act, grad_z)
+            grad_b = jnp.einsum("nhwd->d", grad_z)
+        elif blk > 0 and layer == 0 and not conv:
+            # Token mixing FC
+            grad_w = jnp.einsum("npc,npd->cd", pre_act, grad_z)
+            grad_b = jnp.einsum("npc->c", grad_z)
+        elif (blk == 0 and layer == 0) or (blk > 0 and layer == 1):
+            grad_z = jnp.reshape(grad_z, [B, P_, -1])
+            # Channel mixing FC
+            grad_w = jnp.einsum("npc,npd->cd", pre_act, grad_z)
+            grad_b = jnp.einsum("npc->c", grad_z)
+        else:
+            # Channel mixing group FC
+            grad_w = jnp.einsum("npgc,npgd->gcd", pre_act, grad_z)
+            grad_b = jnp.einsum("npgd->gd", grad_z)
+        idx = i
+        grads_now[idx] = (
+            grads_now[idx][0] + grad_w,
+            grads_now[idx][1] + grad_b,
+        )
 
-            # Backprop through normalization.
-            if FLAGS.norm_grad and FLAGS.post_linear_ln:
-                if blk > 0 and layer == 0:
-                    grad_z = jnp.reshape(
-                        ln_grad1(prenorm_act, jnp.reshape(grad_z, prenorm_act.shape)),
-                        dz.shape,
-                    )
-                else:
-                    grad_z = jnp.reshape(
-                        ln_grad(prenorm_act, jnp.reshape(grad_z, prenorm_act.shape)),
-                        dz.shape,
-                    )
-
-            if blk > 0 and layer == 0 and conv:
-                # Token mixing conv
-                H_ = int(math.sqrt(P_))
-                grad_z = jnp.reshape(grad_z, [B, H_, H_, -1])
-                grad_w = conv_grad(weight, pre_act, grad_z)
-                grad_b = jnp.einsum("nhwd->d", grad_z)
-            elif blk > 0 and layer == 0 and not conv:
-                # Token mixing FC
-                grad_w = jnp.einsum("npc,npd->cd", pre_act, grad_z)
-                grad_b = jnp.einsum("npc->c", grad_z)
-            elif (blk == 0 and layer == 0) or (blk > 0 and layer == 1):
-                grad_z = jnp.reshape(grad_z, [B, P_, -1])
-                # Channel mixing FC
-                grad_w = jnp.einsum("npc,npd->cd", pre_act, grad_z)
-                grad_b = jnp.einsum("npc->c", grad_z)
-            else:
-                # Channel mixing group FC
-                grad_w = jnp.einsum("npgc,npgd->gcd", pre_act, grad_z)
-                grad_b = jnp.einsum("npgd->gd", grad_z)
-            idx = i
-            grads_now[idx] = (
-                grads_now[idx][0] + grad_w / float(M),
-                grads_now[idx][1] + grad_b / float(M),
-            )
-
-        # Classification layers.
-        for i, (weight, bias) in enumerate(loss_params):
-            blk = i  # Every block has a loss.
-            if i == len(loss_params) - 1:
-                # Last classification layer.
-                pre_act = states[f"pre_final"]
-                grad_w, grad_b = global_classif_grad(pre_act, weight, bias, label)
-                grad_w = grad_w * FLAGS.last_layer_lr
-                grad_b = grad_b * FLAGS.last_layer_lr
-            else:
-                # Intermediate classification layer.
-                pre_act = states[f"block_{blk}/pre_pred"]
-                grad_w, grad_b = local_classif_grad(pre_act, weight, bias, label)
-                grad_w = grad_w * FLAGS.head_lr
-                grad_b = grad_b * FLAGS.head_lr
-            idx = i + NL
-            grads_now[idx] = (
-                grads_now[idx][0] + grad_w / float(M),
-                grads_now[idx][1] + grad_b / float(M),
-            )
+    # Classification layers.
+    for i, (weight, bias) in enumerate(loss_params):
+        blk = i  # Every block has a loss.
+        if i == len(loss_params) - 1:
+            # Last classification layer.
+            pre_act = states[f"pre_final"]
+            grad_w, grad_b = global_classif_grad(pre_act, weight, bias, label)
+            grad_w = grad_w * FLAGS.last_layer_lr
+            grad_b = grad_b * FLAGS.last_layer_lr
+        else:
+            # Intermediate classification layer.
+            pre_act = states[f"block_{blk}/pre_pred"]
+            grad_w, grad_b = local_classif_grad(pre_act, weight, bias, label)
+            grad_w = grad_w * FLAGS.head_lr
+            grad_b = grad_b * FLAGS.head_lr
+        idx = i + NL
+        grads_now[idx] = (
+            grads_now[idx][0] + grad_w,
+            grads_now[idx][1] + grad_b,
+        )
 
     if FLAGS.freeze_backbone:
         grads_now = [(0.0 * gw, 0.0 * gb) for (gw, gb) in grads_now[:-1]] + [
