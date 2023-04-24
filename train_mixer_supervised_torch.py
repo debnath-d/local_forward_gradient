@@ -63,10 +63,15 @@ from clu import metric_writers
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+from torch.utils.data import SubsetRandomSampler
+from torchvision.datasets import CIFAR10
 
 # jax.config.update("jax_array", True)
 
-flags.DEFINE_string("data_root", None, "where to store datasets")
+flags.DEFINE_string("data_root", "datasets", "where to store datasets")
 flags.DEFINE_string("exp", "all", "which experiment to run")
 flags.DEFINE_string("workdir", "experiments", "experiment directory")
 flags.DEFINE_float("mom", 0.0, "momentum")
@@ -978,9 +983,61 @@ def get_dataset_cifar10(split, seed=0):
     yield from tfds.as_numpy(ds)
 
 
+def get_dataset_cifar10_torch(split, seed=0):
+    batch_size = FLAGS.batch_size
+    data_root = FLAGS.data_root
+
+    if split == "train":
+        if FLAGS.aug:
+            transform = transforms.Compose(
+                [
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                ]
+            )
+        else:
+            transform = transforms.Compose(
+                [
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                ]
+            )
+    else:
+        transform = transforms.ToTensor()
+
+    dataset = CIFAR10(
+        root=data_root, train=(split != "test"), transform=transform, download=True
+    )
+    num_workers = 8
+
+    # is_parallel = torch.cuda.device_count() > 1
+    # num_parallel = torch.cuda.device_count()
+
+    # if is_parallel:
+    #     batch_size //= num_parallel
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    return dataloader
+
+
 def get_dataset(split, seed=0):
     if FLAGS.dataset in ["cifar-10"]:
         return get_dataset_cifar10(split, seed=seed)
+    else:
+        raise ValueError("Dataset not found {}".format(FLAGS.dataset))
+
+
+def get_dataset_torch(split, seed=0):
+    if FLAGS.dataset in ["cifar-10"]:
+        return get_dataset_cifar10_torch(split, seed=seed)
     else:
         raise ValueError("Dataset not found {}".format(FLAGS.dataset))
 
@@ -989,12 +1046,13 @@ def run_exp(
     mode,
     lr,
     train_loader,
-    train_eval_loader,
     test_loader,
     param_scale,
     layer_sizes,
     num_epochs,
     log_dir,
+    train_loader_torch,
+    test_loader_torch,
 ):
     print("layer sizes", layer_sizes)
     if mode == "backprop":
@@ -1141,6 +1199,7 @@ def run_exp(
         start_time = time.time()
         for _ in range(num_batches):
             batch = next(train_loader)
+            batch_torch = next(iter(train_loader_torch))
             params, opt_state, logs, key = step_fn(batch, params, opt_state, key)
             if is_parallel:
                 total_loss += logs["loss"][0] / float(num_batches)
@@ -1161,18 +1220,10 @@ def run_exp(
         epoch_time = time.time() - start_time
 
         # Evaluate
-        if FLAGS.train_eval:
-            train_acc = 0.0
-            for _ in range(num_batches_eval):
-                batch = next(train_eval_loader)
-                train_acc_ = accuracy_fn(params, batch)
-                if is_parallel:
-                    train_acc_ = train_acc_[0]
-                train_acc += train_acc_ / float(num_batches_eval)
-
         test_acc = 0.0
         for batch in range(num_batches_test):
             batch = next(test_loader)
+            batch_torch = next(iter(test_loader_torch))
             test_acc_ = accuracy_fn(params, batch)
             if is_parallel:
                 test_acc_ = test_acc_[0]
@@ -1223,14 +1274,14 @@ def main(_):
     group_ratio = [int(d) for d in FLAGS.group_ratio.split(",")]
     layer_sizes = get_layer_sizes(
         md,
-        FLAGS.num_patches,
-        FLAGS.num_channel_mlp_units,
-        FLAGS.num_blocks,
-        FLAGS.num_groups,
-        FLAGS.concat_groups,
-        FLAGS.same_head,
-        FLAGS.conv_mixer,
-        FLAGS.kernel_size,
+        num_patches=FLAGS.num_patches,
+        num_channel_mlp_units=FLAGS.num_channel_mlp_units,
+        num_blocks=FLAGS.num_blocks,
+        num_groups=FLAGS.num_groups,
+        concat_groups=FLAGS.concat_groups,
+        same_head=FLAGS.same_head,
+        conv=FLAGS.conv_mixer,
+        ksize=FLAGS.kernel_size,
         num_channel_mlp_hidden_units=FLAGS.num_channel_mlp_hidden_units,
         downsample=downsample,
         channel_ratio=channel_ratio,
@@ -1239,81 +1290,45 @@ def main(_):
     param_scale = get_param_scale(FLAGS.init_scheme, layer_sizes)
     print("param scale", param_scale)
     num_epochs = FLAGS.num_epochs
-    experiment = FLAGS.exp
     train_loader = get_dataset("train", seed=0)
-    if FLAGS.train_eval:
-        train_eval_loader = get_dataset("train_eval", seed=1)
-    else:
-        train_eval_loader = None
+    train_loader_torch = get_dataset_torch(split="train", seed=0)
     test_loader = get_dataset("test", seed=0)
+    test_loader_torch = get_dataset_torch(split="test", seed=0)
 
-    fname = "cifar_mixer_t1c2_fg"
     exp_dir = FLAGS.workdir
     fname_full = f"{exp_dir}/results.pkl"
 
-    if experiment == "all":
-        keys = [
-            "backprop",
-            "forward_grad_weights",
-            "forward_grad_activations",
-        ]
-        lr_list = [float(s) for s in FLAGS.lr.split(",")]
-        all_results = {}
-        for mode in keys:
-            all_results[mode] = {}
-            log_dir = f"{exp_dir}/{mode}"
-            if not tf.io.gfile.exists(log_dir):
-                tf.io.gfile.makedirs(log_dir)
-            for lr in lr_list:
-                lr_dir = "{}/{:.2e}".format(log_dir, lr)
-                if not tf.io.gfile.exists(lr_dir):
-                    tf.io.gfile.makedirs(lr_dir)
-                results = run_exp(
-                    mode,
-                    lr,
-                    train_loader,
-                    train_eval_loader,
-                    test_loader,
-                    param_scale,
-                    layer_sizes,
-                    num_epochs,
-                    lr_dir,
-                )
-                all_results[mode][lr] = results
-        if jax.process_index() == 0:
-            pkl.dump(all_results, tf.io.gfile.GFile(fname_full, "wb"))
-    else:
-        exp_list = experiment.split(",")
-        lr_list = [float(s) for s in FLAGS.lr.split(",")]
-        for exp in exp_list:
-            log_dir = f"{exp_dir}/{exp}"
-            if not tf.io.gfile.exists(log_dir):
-                tf.io.gfile.makedirs(log_dir)
-            for lr in lr_list:
-                print(lr)
-                lr_dir = "{}/{:.2e}".format(log_dir, lr)
-                if not tf.io.gfile.exists(lr_dir):
-                    tf.io.gfile.makedirs(lr_dir)
-                results = run_exp(
-                    exp,
-                    lr,
-                    train_loader,
-                    train_eval_loader,
-                    test_loader,
-                    param_scale,
-                    layer_sizes,
-                    num_epochs,
-                    lr_dir,
-                )
-                if tf.io.gfile.exists(fname_full):
-                    all_results = pkl.load(tf.io.gfile.GFile(fname_full, "rb"))
-                else:
-                    all_results = {}
-                if exp not in all_results:
-                    all_results[exp] = {}
-                all_results[exp][lr] = results
-                if jax.process_index() == 0:
-                    pkl.dump(all_results, tf.io.gfile.GFile(fname_full, "wb"))
+    keys = [
+        "backprop",
+        "forward_grad_weights",
+        "forward_grad_activations",
+    ]
+    lr_list = [float(s) for s in FLAGS.lr.split(",")]
+    all_results = {}
+    for mode in keys:
+        all_results[mode] = {}
+        log_dir = f"{exp_dir}/{mode}"
+        if not tf.io.gfile.exists(log_dir):
+            tf.io.gfile.makedirs(log_dir)
+        for lr in lr_list:
+            lr_dir = "{}/{:.2e}".format(log_dir, lr)
+            if not tf.io.gfile.exists(lr_dir):
+                tf.io.gfile.makedirs(lr_dir)
+            results = run_exp(
+                mode=mode,
+                lr=lr,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                param_scale=param_scale,
+                layer_sizes=layer_sizes,
+                num_epochs=num_epochs,
+                log_dir=lr_dir,
+                train_loader_torch=train_loader_torch,
+                test_loader_torch=test_loader_torch,
+            )
+            all_results[mode][lr] = results
+    if jax.process_index() == 0:
+        pkl.dump(all_results, tf.io.gfile.GFile(fname_full, "wb"))
 
 
 if __name__ == "__main__":
